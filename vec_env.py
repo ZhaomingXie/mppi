@@ -43,6 +43,162 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                     
                 remote.send((np.stack(obs_list), np.stack(rew_list), np.stack(done_list), info_list))
                 
+            elif cmd == 'step_dynamics':
+                # Step without reset and return full state (qpos, qvel)
+                # data is actions
+                actions = data
+                next_states = []
+                rewards = []
+                dones = []
+                
+                for i, env in enumerate(envs):
+                    # Step
+                    ob, reward, done, info = env.step(actions[i])
+                    # Do NOT reset
+                    
+                    # Get full state
+                    qpos = env.data.qpos.copy()
+                    qvel = env.data.qvel.copy()
+                    next_states.append(np.concatenate([qpos, qvel]))
+                    rewards.append(reward)
+                    dones.append(done)
+                    
+                remote.send((np.stack(next_states), np.stack(rewards), np.stack(dones)))
+
+            elif cmd == 'compute_jacobians':
+                # data is (x_traj, u_traj, aux_traj, epsilon)
+                x_traj, u_traj, aux_traj, epsilon = data
+                H = len(x_traj)
+                
+                # Results: (n_envs_local, H, 37)
+                # We will populate this sparsely but deterministically
+                results = np.zeros((n_envs_local, H, 37))
+                
+                # Iterate in blocks of 2 time steps
+                for t_block in range(0, H, 2):
+                    
+                    for i, env in enumerate(envs):
+                        global_idx = start_idx + i
+                        
+                        # Map global_idx to (t_offset, p_idx)
+                        # 0-49: t_block, 50-99: t_block + 1
+                        if global_idx < 50:
+                            t_offset = 0
+                            p_idx = global_idx
+                        else:
+                            t_offset = 1
+                            p_idx = global_idx - 50
+                            
+                        t = t_block + t_offset
+                        
+                        if t >= H:
+                            continue
+                            
+                        # Nominal data for time t
+                        x_nominal = x_traj[t]
+                        u_nominal = u_traj[t]
+                        aux = aux_traj[t]
+                        
+                        qpos = x_nominal[:19].copy()
+                        qvel = x_nominal[19:].copy()
+                        u = u_nominal.copy()
+                        
+                        # Apply perturbation (Forward Difference)
+                        # p_idx 0-36: state, 37-48: action
+                        if p_idx < 37:
+                            # x + eps
+                            dim = p_idx
+                            if dim < 19:
+                                qpos[dim] += epsilon
+                            else:
+                                qvel[dim - 19] += epsilon
+                        elif p_idx < 49:
+                            # u + eps
+                            dim = p_idx - 37
+                            u[dim] += epsilon
+                        else:
+                            # Idle env (e.g. index 49, 99)
+                            continue
+                            
+                        # Set state
+                        env.set_state((qpos, qvel, *aux))
+                        
+                        # Step
+                        ob, reward, done, info = env.step(u)
+                        
+                        # Get next state
+                        qpos_next = env.data.qpos.copy()
+                        qvel_next = env.data.qvel.copy()
+                        results[i, t] = np.concatenate([qpos_next, qvel_next])
+                        
+                remote.send(results)
+
+            elif cmd == 'rollout_feedback':
+                # data is (x0, u_nom, x_nom, k, K, alphas, aux_start)
+                x0, u_nom, x_nom, k, K, alphas, aux_start = data
+                H = len(u_nom)
+                
+                # Each env handles one alpha
+                # global_idx = start_idx + i
+                
+                results = []
+                
+                for i, env in enumerate(envs):
+                    global_idx = start_idx + i
+                    
+                    if global_idx < len(alphas):
+                        alpha = alphas[global_idx]
+                        
+                        # Initialize
+                        qpos = x0[:19]
+                        qvel = x0[19:]
+                        env.set_state((qpos, qvel, *aux_start))
+                        
+                        curr_x = x0.copy()
+                        curr_aux = aux_start
+                        
+                        x_traj = np.zeros((H + 1, 37))
+                        u_traj = np.zeros((H, 12))
+                        x_traj[0] = curr_x
+                        
+                        valid = True
+                        
+                        for t in range(H):
+                            # Control law
+                            dx = curr_x - x_nom[t]
+                            u = u_nom[t] + alpha * k[t] + K[t] @ dx
+                            u = np.clip(u, -1.0, 1.0)
+                            u_traj[t] = u
+                            
+                            # Step
+                            ob, reward, done, info = env.step(u)
+                            
+                            # Get next state
+                            qpos_next = env.data.qpos.copy()
+                            qvel_next = env.data.qvel.copy()
+                            curr_x = np.concatenate([qpos_next, qvel_next])
+                            x_traj[t+1] = curr_x
+                            
+                            # Update aux (approximate)
+                            p, s, sp, m = curr_aux
+                            curr_aux = ((p + 1) % 20, s + 1, sp, m)
+                            
+                            if done:
+                                # Handle fall?
+                                # Just return what we have?
+                                # Or mark as invalid?
+                                # For now, let's continue but maybe cost will be high
+                                pass
+                                
+                        results.append((x_traj, u_traj, alpha))
+                    else:
+                        results.append(None)
+                        
+                remote.send(results)
+
+
+
+                
             elif cmd == 'reset':
                 obs_list = [env.reset() for env in envs]
                 remote.send(np.stack(obs_list))
@@ -66,6 +222,14 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                 for env in envs:
                     env.set_state(data)
                 remote.send(True)  # Confirm state was set
+                
+            elif cmd == 'set_batch_state':
+                # data is a list/array of states, one for each env
+                states = data
+                for i, env in enumerate(envs):
+                    env.set_state(states[i])
+                remote.send(True)
+
                 
             elif cmd == 'rollout':
                 # data is (horizon, state)
@@ -232,6 +396,20 @@ class ParallelGo2Env:
         # obs is tuple of (n_workers, n_envs_local, obs_dim) -> (n_envs, obs_dim)
         return np.concatenate(obs), np.concatenate(rews), np.concatenate(dones), sum(infos, [])
 
+    def step_dynamics(self, actions):
+        # actions: (n_envs, action_dim)
+        start_idx = 0
+        for i, remote in enumerate(self.remotes):
+            n_envs_local = self.envs_per_worker[i]
+            remote.send(('step_dynamics', actions[start_idx : start_idx + n_envs_local]))
+            start_idx += n_envs_local
+            
+        results = [remote.recv() for remote in self.remotes]
+        next_states, rews, dones = zip(*results)
+        
+        return np.concatenate(next_states), np.concatenate(rews), np.concatenate(dones)
+
+
     def reset(self):
         for remote in self.remotes:
             remote.send(('reset', None))
@@ -243,6 +421,52 @@ class ParallelGo2Env:
         # Wait for confirmation from all workers
         for remote in self.remotes:
             remote.recv()
+
+    def set_batch_state(self, states):
+        # states: list of states, length must be n_envs
+        assert len(states) == self.n_envs
+        
+        start_idx = 0
+        for i, remote in enumerate(self.remotes):
+            n_envs_local = self.envs_per_worker[i]
+            local_states = states[start_idx : start_idx + n_envs_local]
+            remote.send(('set_batch_state', local_states))
+            start_idx += n_envs_local
+            
+        # Wait for confirmation
+        for remote in self.remotes:
+            remote.recv()
+
+
+    def compute_jacobians(self, x_traj, u_traj, aux_traj, epsilon=1e-4):
+        # x_traj: (H, 37)
+        # u_traj: (H, 12)
+        # aux_traj: list of H tuples
+        
+        for remote in self.remotes:
+            remote.send(('compute_jacobians', (x_traj, u_traj, aux_traj, epsilon)))
+            
+        results = [remote.recv() for remote in self.remotes]
+        # results is list of (n_envs_local, H, 37)
+        # Concatenate along env dimension
+        return np.concatenate(results, axis=0)
+
+        return np.concatenate(results, axis=0)
+
+    def rollout_feedback(self, x0, u_nom, x_nom, k, K, alphas, aux_start):
+        # Broadcast to all workers
+        # But only first few envs will do work
+        for remote in self.remotes:
+            remote.send(('rollout_feedback', (x0, u_nom, x_nom, k, K, alphas, aux_start)))
+            
+        results = [remote.recv() for remote in self.remotes]
+        # Flatten
+        flat_results = []
+        for r in results:
+            flat_results.extend(r)
+            
+        # Filter None
+        return [r for r in flat_results if r is not None]
 
     def rollout(self, actions, state=None):
         # actions: (n_envs, horizon, action_dim)
