@@ -4,11 +4,12 @@ from vec_env import ParallelGo2Env
 from env import Go2Env
 
 class ILQRPlanner:
-    def __init__(self, env, horizon=20, iterations=10, precompute=True):
+    def __init__(self, env, horizon=20, iterations=10, precompute=True, mode=0):
         self.env = env
         self.horizon = horizon
         self.iterations = iterations
         self.precompute = precompute
+        self.mode = mode # 0: Trot, 1: Pace
         
         # Dimensions
         self.qpos_dim = 19
@@ -18,13 +19,13 @@ class ILQRPlanner:
         
         # Cost weights
         self.Q = np.diag(np.concatenate([
-            [10, 10, 10],          # pos (x,y,z)
+            [0, 0, 10],          # pos (x,y,z)
             [10, 10, 10, 10],      # quat
-            [10.0] * 12,            # joint angles
-            [1.0] * 6,             # base vel
+            [10.0] * 12,           # joint angles
+            [0.10] * 6,             # base vel
             [0.1] * 12             # joint vel
         ]))
-        self.R = np.eye(self.action_dim) * 0.1
+        self.R = np.eye(self.action_dim) * 0.5
         
         # Initial guess for controls
         self.us = np.zeros((self.horizon, self.action_dim))
@@ -37,7 +38,8 @@ class ILQRPlanner:
         self.fu_pre = {}
         
         if self.precompute:
-            print("Precomputing derivatives around reference trajectory...")
+            gait_name = "Trot" if self.mode == 0 else "Pace"
+            print(f"Precomputing derivatives around {gait_name} reference trajectory...")
             self._precompute_derivatives()
 
     def get_kinematic_reference(self, phase, speed, mode, sim_step_counter):
@@ -59,38 +61,58 @@ class ILQRPlanner:
         # Gait logic
         # speed=0 means stepping in place
         speed_factor_y = 0.4 * speed
-        lift_factor_z = 0.9 # Lift height
+        lift_factor_z = 1.0 # Lift height
+        
+        # Use the mode passed in, which should match self.mode if everything is consistent
+        # But for robustness, we use the argument
+        
+        sin_phase = np.sin(phase * phase_to_rad)
         
         if phase < half_phase:
-            # First half: FR (7,8,9) and RL (16,17,18) lift
-            sin_phase = np.sin(phase * phase_to_rad)
-            
-            # FR
-            ref[8] = 0.65 - speed_factor_y * sin_phase           
-            ref[9] = -1.0 - lift_factor_z * sin_phase
-            
-            # RL
-            ref[17] = 0.65 - speed_factor_y * sin_phase
-            ref[18] = -1.0 - lift_factor_z * sin_phase
+            # First half
+            if mode == 0: # Trot: FR (7) and RL (16) lift
+                # FR
+                ref[8] = 0.65 - speed_factor_y * sin_phase           
+                ref[9] = -1.0 - lift_factor_z * sin_phase
+                
+                # RL
+                ref[17] = 0.65 - speed_factor_y * sin_phase
+                ref[18] = -1.0 - lift_factor_z * sin_phase
+            else: # Pace: FR (7) and RR (13) lift
+                # FR
+                ref[8] = 0.65 - speed_factor_y * sin_phase           
+                ref[9] = -1.0 - lift_factor_z * sin_phase
+                
+                # RR
+                ref[14] = 0.65 - speed_factor_y * sin_phase
+                ref[15] = -1.0 - lift_factor_z * sin_phase
             
         else:
-            # Second half: FL (10,11,12) and RR (13,14,15) lift
+            # Second half
             sin_phase = np.sin((phase - half_phase) * phase_to_rad)
             
-            # FL
-            ref[11] = 0.65 - speed_factor_y * sin_phase
-            ref[12] = -1.0 - lift_factor_z * sin_phase
-            
-            # RR
-            ref[14] = 0.65 - speed_factor_y * sin_phase
-            ref[15] = -1.0 - lift_factor_z * sin_phase
+            if mode == 0: # Trot: FL (10) and RR (13) lift
+                # FL
+                ref[11] = 0.65 - speed_factor_y * sin_phase
+                ref[12] = -1.0 - lift_factor_z * sin_phase
+                
+                # RR
+                ref[14] = 0.65 - speed_factor_y * sin_phase
+                ref[15] = -1.0 - lift_factor_z * sin_phase
+            else: # Pace: FL (10) and RL (16) lift
+                # FL
+                ref[11] = 0.65 - speed_factor_y * sin_phase
+                ref[12] = -1.0 - lift_factor_z * sin_phase
+                
+                # RL
+                ref[17] = 0.65 - speed_factor_y * sin_phase
+                ref[18] = -1.0 - lift_factor_z * sin_phase
             
         return ref
             
     def _precompute_derivatives(self):
         # Compute Jacobians for all phases (0-19) around reference
-        # We assume speed=0, mode=0 (standing/trotting in place) for now
-        # Or we can just compute for the default gait parameters
+        # We assume speed=0, mode=self.mode (standing/trotting/pacing in place)
         
         phases = range(20)
         x_refs = []
@@ -99,15 +121,12 @@ class ILQRPlanner:
         
         for p in phases:
             # Get kinematic reference state
-            # We need to construct full state (qpos, qvel)
-            # get_kinematic_reference returns qpos (19,)
-            # We assume qvel is 0 for reference (approximation)
-            xref = self.get_kinematic_reference(p, 0.0, 0, 0)
+            xref = self.get_kinematic_reference(p, 0.0, self.mode, 0)
             xref_full = np.concatenate([xref, np.zeros(18)])
             
             x_refs.append(xref_full)
             u_refs.append(np.zeros(12))
-            aux_refs.append((p, 0, 0.0, 0)) # sim_step_counter=0, speed=0, mode=0
+            aux_refs.append((p, 0, 0.0, self.mode)) # sim_step_counter=0, speed=0, mode=self.mode
             
         # We need to compute f(x) and f(x+eps)
         # 1. Compute f(x+eps) using compute_jacobians
@@ -272,7 +291,7 @@ class ILQRPlanner:
         K = np.zeros((H, self.action_dim, self.state_dim))
         
         Vx = lx[-1].copy() # Terminal cost derivative (approximate with last step cost)
-        Vxx = np.eye(self.state_dim) # Terminal cost Hessian (Identity)
+        Vxx = lxx[-1].copy() # Terminal cost Hessian (Use running cost Hessian Q instead of Identity)
         
         for t in range(H - 1, -1, -1):
             Qx = lx[t] + fx[t].T @ Vx
@@ -284,7 +303,7 @@ class ILQRPlanner:
             # Regularization
             Quu_evals, Quu_evecs = np.linalg.eigh(Quu)
             Quu_evals[Quu_evals < 0] = 0.0
-            Quu_evals += 1e-3 # Increased regularization
+            Quu_evals += 1e-2 # Increased regularization for stability
             Quu_inv = Quu_evecs @ np.diag(1.0 / Quu_evals) @ Quu_evecs.T
             
             k[t] = -Quu_inv @ Qu
@@ -323,6 +342,36 @@ class ILQRPlanner:
         # But we can run line search in parallel if we want.
         pass
 
+    def compute_trajectory_cost(self, xs, us, aux_start):
+        H = self.horizon
+        
+        # Pre-allocate reference array
+        x_refs = np.zeros((H, 37))
+        
+        p, s, sp, m = aux_start
+        
+        # Generate references
+        for t in range(H):
+            ref = self.get_kinematic_reference(p, sp, m, s)
+            x_refs[t, :19] = ref
+            # Velocity ref is 0
+            
+            p = (p + 1) % 20
+            s += 1
+            
+        # Vectorized cost
+        dx = xs[:H] - x_refs
+        
+        # State cost (Q is diagonal)
+        Q_diag = np.diag(self.Q)
+        state_cost = np.sum((dx**2) * Q_diag)
+        
+        # Control cost (R is diagonal)
+        R_diag = np.diag(self.R)
+        control_cost = np.sum((us**2) * R_diag)
+        
+        return state_cost + control_cost
+
     def plan(self, initial_state):
         # initial_state: (qpos, qvel, phase, sim_step_counter, speed, mode)
         qpos, qvel, phase, sim_step_counter, speed, mode = initial_state
@@ -342,31 +391,49 @@ class ILQRPlanner:
         curr_aux = aux_start
         
         # 0. Initial trajectory
-        # We can do this in parallel if we had multiple guesses, but here just one.
-        # We need to step the environment to get the trajectory.
-        # We can use the first env of the parallel envs.
+        # Optimize: Use rollout_feedback with zero gains to simulate just 1 env
+        # instead of stepping all 100 envs in a loop
         
-        # For efficiency, let's just use the parallel env with 1 active env
-        for t in range(self.horizon):
-            aux_traj.append(curr_aux)
-            self.env.set_batch_state([curr_aux + tuple([0,0])]*self.env.n_envs) # Hacky way to set state?
-            # No, set_batch_state expects (qpos, qvel, phase, ...)
-            # curr_aux is (phase, ...)
-            # We need to construct full state tuple
-            state_tuple = (curr_x[:19], curr_x[19:], *curr_aux)
+        # Dummy gains
+        k_dummy = np.zeros((self.horizon, self.action_dim))
+        K_dummy = np.zeros((self.horizon, self.action_dim, self.state_dim))
+        
+        # Dummy x_nom (not used since K=0)
+        x_nom_dummy = np.zeros((self.horizon, self.state_dim))
+        
+        # Single alpha to trigger 1 env
+        alphas_dummy = [0.0]
+        
+        results = self.env.rollout_feedback(x0, self.us, x_nom_dummy, k_dummy, K_dummy, alphas_dummy, aux_start)
+        
+        # Extract result
+        if results and results[0] is not None:
+            xs_new, _, _ = results[0]
+            xs = xs_new
             
-            # Use just one env for rollout?
-            # Actually, we can just use the parallel env and ignore others
-            states = [state_tuple] * self.env.n_envs
-            self.env.set_batch_state(states)
-            next_states, _, _ = self.env.step_dynamics(np.array([self.us[t]] * self.env.n_envs))
-            
-            curr_x = next_states[0]
-            xs[t+1] = curr_x
-            
-            # Update aux
-            p, s, sp, m = curr_aux
-            curr_aux = ((p + 1) % 20, s + 1, sp, m)
+            # Reconstruct aux_traj for gradient computation
+            # rollout_feedback doesn't return aux_traj, so we regenerate it locally
+            # This is fast (just integer math)
+            curr_aux = aux_start
+            for t in range(self.horizon):
+                aux_traj.append(curr_aux)
+                p, s, sp, m = curr_aux
+                curr_aux = ((p + 1) % 20, s + 1, sp, m)
+        else:
+            # Fallback (should not happen)
+            print("WARNING: Initial rollout failed, falling back to loop")
+            curr_x = x0
+            curr_aux = aux_start
+            for t in range(self.horizon):
+                aux_traj.append(curr_aux)
+                state_tuple = (curr_x[:19], curr_x[19:], *curr_aux)
+                states = [state_tuple] * self.env.n_envs
+                self.env.set_batch_state(states)
+                next_states, _, _ = self.env.step_dynamics(np.array([self.us[t]] * self.env.n_envs))
+                curr_x = next_states[0]
+                xs[t+1] = curr_x
+                p, s, sp, m = curr_aux
+                curr_aux = ((p + 1) % 20, s + 1, sp, m)
             
         # iLQR Loop
         for i in range(self.iterations):
@@ -380,7 +447,6 @@ class ILQRPlanner:
             alphas = [1.0, 0.5, 0.1]
             
             # Execute rollouts in parallel
-            # rollout_feedback returns list of (x_traj, u_traj, alpha)
             results = self.env.rollout_feedback(x0, self.us, xs[:-1], k, K, alphas, aux_start)
             
             best_cost = float('inf')
@@ -388,23 +454,11 @@ class ILQRPlanner:
             best_xs = xs
             
             for res in results:
+                if res is None: continue
                 new_xs, new_us, alpha = res
                 
-                # Compute cost
-                cost = 0
-                curr_aux_ls = aux_start
-                
-                for t in range(self.horizon):
-                    # Simplified cost calculation
-                    xref = self.get_kinematic_reference(*curr_aux_ls)
-                    xref_full = np.concatenate([xref, np.zeros(18)])
-                    dx_cost = new_xs[t] - xref_full
-                    u = new_us[t]
-                    cost += dx_cost.T @ self.Q @ dx_cost + u.T @ self.R @ u
-                    
-                    # Update aux
-                    p, s, sp, m = curr_aux_ls
-                    curr_aux_ls = ((p + 1) % 20, s + 1, sp, m)
+                # Vectorized cost computation
+                cost = self.compute_trajectory_cost(new_xs, new_us, aux_start)
                     
                 if cost < best_cost:
                     best_cost = cost
@@ -415,55 +469,152 @@ class ILQRPlanner:
             self.us = best_us
             xs = best_xs
             
-        return self.us[0]
+        # Recompute K around the final trajectory to get the correct feedback gain
+        # This is crucial because the K from the loop was for the PREVIOUS trajectory
+        fx, fu, lx, lu, lxx, luu, lux = self.compute_gradients(xs, self.us, aux_traj)
+        k, K = self.backward_pass(fx, fu, lx, lu, lxx, luu, lux)
+            
+        return self.us[0], K[0]
 
 def main():
     # Parameters
-    HORIZON = 20 # Reduced from 20 for stability
-    ITERATIONS = 5
+    # Parameters
+    HORIZON = 10 # Reduced from 20 for stability
+    ITERATIONS = 20
+    GAIT_MODE = 0 # 0: Trot, 1: Pace
+    
+    # Replay mode
+    REPLAY_MODE = True
+    NUM_PLAN_STEPS = 100  # Number of steps to plan before replaying
+    PERTURBATION_SCALE = 0.1 # Noise scale for testing robustness
     
     print("Initializing 100 parallel environments for iLQR...")
     planning_env = ParallelGo2Env(n_envs=100, render_first=False)
     
     print("Initializing simulation environment...")
     sim_env = Go2Env(render=True)
+    sim_env.mode = GAIT_MODE # Set gait mode
     
-    planner = ILQRPlanner(planning_env, horizon=HORIZON, iterations=ITERATIONS)
+    planner = ILQRPlanner(planning_env, horizon=HORIZON, iterations=ITERATIONS, mode=GAIT_MODE)
     
     obs = sim_env.reset()
-    print("Starting iLQR Control...")
+    print(f"Starting iLQR Control with {'Trot' if GAIT_MODE == 0 else 'Pace'} gait...")
+    
+    # Collections for replay
+    recorded_states = []
+    recorded_actions = []
+    recorded_Ks = []
     
     try:
+        step_count = 0
+        planning = True
+        
         while True:
-            start_time = time.time()
-            
-            # Get current state
-            qpos = sim_env.data.qpos.copy()
-            qvel = sim_env.data.qvel.copy()
-            phase = sim_env.phase
-            sim_step_counter = sim_env.sim_step_counter
-            speed = sim_env.speed
-            mode = sim_env.mode
-            
-            full_state = (qpos, qvel, phase, sim_step_counter, speed, mode)
-            
-            # Plan
-            action = planner.plan(full_state)
-            
-            # Execute
-            obs, reward, done, info = sim_env.step(action)
-            
-            if done:
-                print("Robot fell. Resetting.")
-                sim_env.reset()
-                planner.us[:] = 0 # Reset warm start
+            if planning and step_count < NUM_PLAN_STEPS:
+                # PLANNING MODE
+                start_time = time.time()
                 
-            # Timing
-            dt = time.time() - start_time
-            print(f"Step time: {dt*1000:.1f}ms")
-            
+                # Get current state
+                qpos = sim_env.data.qpos.copy()
+                qvel = sim_env.data.qvel.copy()
+                phase = sim_env.phase
+                sim_step_counter = sim_env.sim_step_counter
+                speed = sim_env.speed
+                mode = sim_env.mode
+                
+                full_state = (qpos, qvel, phase, sim_step_counter, speed, mode)
+                
+                # Plan
+                action, K = planner.plan(full_state)
+                
+                # Record
+                if REPLAY_MODE:
+                    recorded_states.append(full_state)
+                    recorded_actions.append(action.copy())
+                    recorded_Ks.append(K.copy())
+                
+                # Execute
+                obs, reward, done, info = sim_env.step(action)
+                
+                if done:
+                    print("Robot fell. Resetting.")
+                    sim_env.reset()
+                    planner.us[:] = 0 # Reset warm start
+                    if REPLAY_MODE:
+                        # Clear recordings and restart
+                        recorded_states.clear()
+                        recorded_actions.clear()
+                        recorded_Ks.clear()
+                        step_count = 0
+                        continue
+                    
+                # Timing
+                dt = time.time() - start_time
+                print(f"Planning step {step_count+1}/{NUM_PLAN_STEPS}: {dt*1000:.1f}ms")
+                
+                step_count += 1
+                
+                if step_count >= NUM_PLAN_STEPS and REPLAY_MODE:
+                    planning = False
+                    print(f"\n{'='*50}")
+                    print(f"SWITCHING TO REPLAY MODE (WITH FEEDBACK & PERTURBATION)")
+                    print(f"{'='*50}")
+                    print(f"Replaying {len(recorded_actions)} steps at real-time speed...")
+                    print(f"Applying random action noise (scale={PERTURBATION_SCALE})...")
+                    sim_env.reset()
+                    
+            else:
+                # REPLAY MODE
+                if not REPLAY_MODE or len(recorded_actions) == 0:
+                    print("No replay enabled or no data recorded. Exiting.")
+                    break
+                
+                # Loop replay continuously
+                while True:
+                    for i, (state, action) in enumerate(zip(recorded_states, recorded_actions)):
+                        start_time = time.time()
+                        
+                        # Get recorded nominal state (x_nom)
+                        qpos_nom, qvel_nom, _, _, _, _ = state
+                        x_nom = np.concatenate([qpos_nom, qvel_nom])
+                        
+                        # Get current state (x)
+                        qpos_curr = sim_env.data.qpos.copy()
+                        qvel_curr = sim_env.data.qvel.copy()
+                        x_curr = np.concatenate([qpos_curr, qvel_curr])
+                        
+                        # Compute feedback action
+                        # u = u_nom + K @ (x - x_nom)
+                        K = recorded_Ks[i]
+                        u_fb = action + K @ (x_curr - x_nom)
+                        
+                        # Add perturbation
+                        noise = np.random.randn(12) * PERTURBATION_SCALE
+                        u_fb += noise
+                        
+                        u_fb = np.clip(u_fb, -1.0, 1.0) # Clip to valid range
+                        
+                        # Execute action
+                        obs, reward, done, info = sim_env.step(u_fb)
+                        
+                        # Real-time timing (50Hz = 0.02s)
+                        elapsed = time.time() - start_time
+                        sleep_time = sim_env.control_dt - elapsed
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+                        
+                        if (i + 1) % 20 == 0:
+                            print(f"Replay: {i+1}/{len(recorded_actions)} steps")
+                            
+                        # If we drift too far or fall, maybe reset?
+                        # But for now let's just let it run to test robustness
+                    
+                    print("\nReplay loop complete, restarting...")
+                    sim_env.reset() # Reset to start state for next loop
+
+                
     except KeyboardInterrupt:
-        print("Stopping...")
+        print("\nStopping...")
     finally:
         planning_env.close()
         sim_env.close()

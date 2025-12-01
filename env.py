@@ -68,12 +68,31 @@ class Go2Env:
         # Reward tracking
         self.total_reward = 0.0
         
-    def reset(self):
+    def reset(self, phase=None, speed=None, mode=None):
         self.sim_step_counter = 0
         self.total_reward = 0.0
-        self.phase = 0#np.random.randint(0, self.max_phase)
-        self.speed = 0#(np.random.randint(0, 11) - 5) * 0.1
-        self.mode = 0#np.random.randint(0, 2)
+        
+        # Use provided values or defaults (0) if not set previously
+        # If self.mode is already set (e.g. by user), preserve it unless overridden
+        
+        if phase is not None:
+            self.phase = phase
+        else:
+            self.phase = 0
+            
+        if speed is not None:
+            self.speed = speed
+        else:
+            # Preserve existing speed if non-zero? Or reset?
+            # Usually reset speed to 0 is desired for new episode
+            self.speed = 0
+            
+        if mode is not None:
+            self.mode = mode
+        else:
+            # Preserve existing mode! This is the fix.
+            # If it was never set, it initialized to 0 in __init__
+            pass
 
         self.get_kinematic_reference()
         
@@ -186,32 +205,33 @@ class Go2Env:
         # Gait logic - optimized to avoid function calls
         sin_phase = np.sin(self.phase * self._phase_to_rad)
         speed_factor_y = 0.4 * self.speed
+        lift_factor_z = 0.8  # Lift height (updated to match iLQR)
         
         if self.phase <= self._half_max_phase:
             # First half of gait
             if self.mode == 0:  # Trot: FR (7) and RL (16)
                 self.reference[8] = 0.65 - speed_factor_y * sin_phase
-                self.reference[9] = -1.0 - 0.7 * sin_phase
+                self.reference[9] = -1.0 - lift_factor_z * sin_phase
                 self.reference[17] = 0.65 - speed_factor_y * sin_phase
-                self.reference[18] = -1.0 - 0.7 * sin_phase
+                self.reference[18] = -1.0 - lift_factor_z * sin_phase
             else:  # Pace: FR (7) and RR (13)
                 self.reference[8] = 0.65 - speed_factor_y * sin_phase
-                self.reference[9] = -1.0 - 0.7 * sin_phase
+                self.reference[9] = -1.0 - lift_factor_z * sin_phase
                 self.reference[14] = 0.65 - speed_factor_y * sin_phase
-                self.reference[15] = -1.0 - 0.7 * sin_phase
+                self.reference[15] = -1.0 - lift_factor_z * sin_phase
         else:
             # Second half of gait
             sin_shifted = np.sin((self.phase - self._half_max_phase) * self._phase_to_rad)
             if self.mode == 0:  # Trot: FL (10) and RR (13)
                 self.reference[11] = 0.65 - speed_factor_y * sin_shifted
-                self.reference[12] = -1.0 - 0.7 * sin_shifted
+                self.reference[12] = -1.0 - lift_factor_z * sin_shifted
                 self.reference[14] = 0.65 - speed_factor_y * sin_shifted
-                self.reference[15] = -1.0 - 0.7 * sin_shifted
+                self.reference[15] = -1.0 - lift_factor_z * sin_shifted
             else:  # Pace: FL (10) and RL (16)
                 self.reference[11] = 0.65 - speed_factor_y * sin_shifted
-                self.reference[12] = -1.0 - 0.7 * sin_shifted
+                self.reference[12] = -1.0 - lift_factor_z * sin_shifted
                 self.reference[17] = 0.65 - speed_factor_y * sin_shifted
-                self.reference[18] = -1.0 - 0.7 * sin_shifted
+                self.reference[18] = -1.0 - lift_factor_z * sin_shifted
 
     def get_observation(self):
         # Optimized observation computation using pre-allocated buffer
