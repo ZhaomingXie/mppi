@@ -42,73 +42,113 @@ class ILQRPlanner:
             print(f"Precomputing derivatives around {gait_name} reference trajectory...")
             self._precompute_derivatives()
 
+            
     def get_kinematic_reference(self, phase, speed, mode, sim_step_counter):
         # Re-implementing simplified version here for cost computation
-        ref = np.zeros(19)
-        ref[0] = speed * sim_step_counter * 0.02 # x pos
-        ref[1:7] = [0, 0.38, 1.0, 0.0, 0.0, 0.0] # y, z, quat
+        ref_pos = np.zeros(19)
+        ref_vel = np.zeros(18)
+        
+        # x pos
+        ref_pos[0] = speed * sim_step_counter * 0.02 
+        ref_vel[0] = speed # x vel
+        
+        ref_pos[1:7] = [0, 0.38, 1.0, 0.0, 0.0, 0.0] # y, z, quat
+        # ref_vel[0:6] is already 0 for y,z,r,p,y
         
         # Default leg positions
-        ref[7::3] = 0      # x
-        ref[8::3] = 0.65   # y
-        ref[9::3] = -1.0   # z
+        ref_pos[7::3] = 0      # x
+        ref_pos[8::3] = 0.65   # y
+        ref_pos[9::3] = -1.0   # z
         
         # Gait parameters
         max_phase = 20
         half_phase = 10
         phase_to_rad = 2 * np.pi / max_phase
+        dt = 0.02
+        omega = phase_to_rad / dt
         
         # Gait logic
         # speed=0 means stepping in place
         speed_factor_y = 0.4 * speed
         lift_factor_z = 1.0 # Lift height
         
-        # Use the mode passed in, which should match self.mode if everything is consistent
-        # But for robustness, we use the argument
-        
         sin_phase = np.sin(phase * phase_to_rad)
+        cos_phase = np.cos(phase * phase_to_rad)
+        
+        # Velocity factors
+        # d/dt (A * sin(w*t)) = A * w * cos(w*t)
+        # d/dt (A * cos(w*t)) = -A * w * sin(w*t)
         
         if phase < half_phase:
             # First half
+            # Active legs move:
+            # y = 0.65 - speed_factor_y * sin
+            # z = -1.0 - lift_factor_z * sin
+            
+            vy = -speed_factor_y * omega * cos_phase
+            vz = -lift_factor_z * omega * cos_phase
+            
             if mode == 0: # Trot: FR (7) and RL (16) lift
-                # FR
-                ref[8] = 0.65 - speed_factor_y * sin_phase           
-                ref[9] = -1.0 - lift_factor_z * sin_phase
+                # FR (idx 7,8,9 -> vel idx 6,7,8)
+                ref_pos[8] = 0.65 - speed_factor_y * sin_phase           
+                ref_pos[9] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[7] = vy
+                ref_vel[8] = vz
                 
-                # RL
-                ref[17] = 0.65 - speed_factor_y * sin_phase
-                ref[18] = -1.0 - lift_factor_z * sin_phase
+                # RL (idx 16,17,18 -> vel idx 15,16,17)
+                ref_pos[17] = 0.65 - speed_factor_y * sin_phase
+                ref_pos[18] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[16] = vy
+                ref_vel[17] = vz
+                
             else: # Pace: FR (7) and RR (13) lift
                 # FR
-                ref[8] = 0.65 - speed_factor_y * sin_phase           
-                ref[9] = -1.0 - lift_factor_z * sin_phase
+                ref_pos[8] = 0.65 - speed_factor_y * sin_phase           
+                ref_pos[9] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[7] = vy
+                ref_vel[8] = vz
                 
-                # RR
-                ref[14] = 0.65 - speed_factor_y * sin_phase
-                ref[15] = -1.0 - lift_factor_z * sin_phase
+                # RR (idx 13,14,15 -> vel idx 12,13,14)
+                ref_pos[14] = 0.65 - speed_factor_y * sin_phase
+                ref_pos[15] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[13] = vy
+                ref_vel[14] = vz
             
         else:
             # Second half
             sin_phase = np.sin((phase - half_phase) * phase_to_rad)
+            cos_phase = np.cos((phase - half_phase) * phase_to_rad)
+            
+            vy = -speed_factor_y * omega * cos_phase
+            vz = -lift_factor_z * omega * cos_phase
             
             if mode == 0: # Trot: FL (10) and RR (13) lift
-                # FL
-                ref[11] = 0.65 - speed_factor_y * sin_phase
-                ref[12] = -1.0 - lift_factor_z * sin_phase
+                # FL (idx 10,11,12 -> vel idx 9,10,11)
+                ref_pos[11] = 0.65 - speed_factor_y * sin_phase
+                ref_pos[12] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[10] = vy
+                ref_vel[11] = vz
                 
                 # RR
-                ref[14] = 0.65 - speed_factor_y * sin_phase
-                ref[15] = -1.0 - lift_factor_z * sin_phase
+                ref_pos[14] = 0.65 - speed_factor_y * sin_phase
+                ref_pos[15] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[13] = vy
+                ref_vel[14] = vz
+                
             else: # Pace: FL (10) and RL (16) lift
                 # FL
-                ref[11] = 0.65 - speed_factor_y * sin_phase
-                ref[12] = -1.0 - lift_factor_z * sin_phase
+                ref_pos[11] = 0.65 - speed_factor_y * sin_phase
+                ref_pos[12] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[10] = vy
+                ref_vel[11] = vz
                 
                 # RL
-                ref[17] = 0.65 - speed_factor_y * sin_phase
-                ref[18] = -1.0 - lift_factor_z * sin_phase
+                ref_pos[17] = 0.65 - speed_factor_y * sin_phase
+                ref_pos[18] = -1.0 - lift_factor_z * sin_phase
+                ref_vel[16] = vy
+                ref_vel[17] = vz
             
-        return ref
+        return ref_pos, ref_vel
             
     def _precompute_derivatives(self):
         # Compute Jacobians for all phases (0-19) around reference
@@ -121,8 +161,8 @@ class ILQRPlanner:
         
         for p in phases:
             # Get kinematic reference state
-            xref = self.get_kinematic_reference(p, 0.0, self.mode, 0)
-            xref_full = np.concatenate([xref, np.zeros(18)])
+            xref_pos, xref_vel = self.get_kinematic_reference(p, 0.0, self.mode, 0)
+            xref_full = np.concatenate([xref_pos, xref_vel])
             
             x_refs.append(xref_full)
             u_refs.append(np.zeros(12))
@@ -272,8 +312,8 @@ class ILQRPlanner:
                 
             # Cost derivatives (analytical)
             # J = (x - xref)^T Q (x - xref) + u^T R u
-            xref = self.get_kinematic_reference(phase, speed, mode, step_counter)
-            xref_full = np.concatenate([xref, np.zeros(18)]) # velocity ref is 0 for now
+            xref_pos, xref_vel = self.get_kinematic_reference(phase, speed, mode, step_counter)
+            xref_full = np.concatenate([xref_pos, xref_vel])
             
             dx = x - xref_full
             lx[t] = self.Q @ dx
@@ -352,9 +392,9 @@ class ILQRPlanner:
         
         # Generate references
         for t in range(H):
-            ref = self.get_kinematic_reference(p, sp, m, s)
-            x_refs[t, :19] = ref
-            # Velocity ref is 0
+            ref_pos, ref_vel = self.get_kinematic_reference(p, sp, m, s)
+            x_refs[t, :19] = ref_pos
+            x_refs[t, 19:] = ref_vel
             
             p = (p + 1) % 20
             s += 1
@@ -481,7 +521,7 @@ def main():
     # Parameters
     HORIZON = 10 # Reduced from 20 for stability
     ITERATIONS = 20
-    GAIT_MODE = 0 # 0: Trot, 1: Pace
+    GAIT_MODE = 1 # 0: Trot, 1: Pace
     
     # Replay mode
     REPLAY_MODE = True
