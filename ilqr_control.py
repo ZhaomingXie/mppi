@@ -1,7 +1,8 @@
 import numpy as np
 import time
-from vec_env import ParallelGo2Env
+from vec_env import ParallelEnv
 from env import Go2Env
+from spot_env import SpotEnv
 
 class ILQRPlanner:
     def __init__(self, env, horizon=20, iterations=10, precompute=True, mode=0):
@@ -12,19 +13,25 @@ class ILQRPlanner:
         self.mode = mode # 0: Trot, 1: Pace
         
         # Dimensions
-        self.qpos_dim = 19
-        self.qvel_dim = 18
-        self.state_dim = self.qpos_dim + self.qvel_dim # 37
-        self.action_dim = 12
+        self.qpos_dim = env.qpos_dim
+        self.qvel_dim = env.qvel_dim
+        self.state_dim = self.qpos_dim + self.qvel_dim
+        self.action_dim = env.action_dim
         
         # Cost weights
-        self.Q = np.diag(np.concatenate([
-            [0, 0, 10],          # pos (x,y,z)
+        # Q matrix depends on dimensions
+        # pos (3), quat (4), joints (n_joints), base_vel (6), joint_vel (n_joints)
+        n_joints = self.action_dim
+        
+        q_diag = np.concatenate([
+            [1, 1, 10],          # pos (x,y,z)
             [10, 10, 10, 10],      # quat
-            [10.0] * 12,           # joint angles
-            [0.10] * 6,             # base vel
-            [0.1] * 12             # joint vel
-        ]))
+            [10.0] * n_joints,     # joint angles
+            [1.0] * 6,            # base vel
+            [0.1] * n_joints       # joint vel
+        ])
+        
+        self.Q = np.diag(q_diag)
         self.R = np.eye(self.action_dim) * 0.5
         
         # Initial guess for controls
@@ -37,6 +44,16 @@ class ILQRPlanner:
         self.fx_pre = {}
         self.fu_pre = {}
         
+        # Check if precomputation is possible given environment count
+        # We need (state_dim + action_dim) envs per timestep * 2 (for 2 timesteps in parallel)
+        envs_needed_per_timestep = self.state_dim + self.action_dim
+        envs_needed_total = envs_needed_per_timestep * 2
+        
+        if self.precompute and envs_needed_total > env.n_envs:
+            print(f"WARNING: Precomputation requires {envs_needed_total} envs but only {env.n_envs} available.")
+            print(f"Disabling precomputation. Using online gradient computation instead.")
+            self.precompute = False
+        
         if self.precompute:
             gait_name = "Trot" if self.mode == 0 else "Pace"
             print(f"Precomputing derivatives around {gait_name} reference trajectory...")
@@ -45,24 +62,41 @@ class ILQRPlanner:
             
     def get_kinematic_reference(self, phase, speed, mode, sim_step_counter):
         # Re-implementing simplified version here for cost computation
-        ref_pos = np.zeros(19)
-        ref_vel = np.zeros(18)
+        ref_pos = np.zeros(self.qpos_dim)
+        ref_vel = np.zeros(self.qvel_dim)
         
         # x pos
         ref_pos[0] = speed * sim_step_counter * 0.02 
         ref_vel[0] = speed # x vel
         
-        ref_pos[1:7] = [0, 0.38, 1.0, 0.0, 0.0, 0.0] # y, z, quat
-        # ref_vel[0:6] is already 0 for y,z,r,p,y
+        # Base orientation/height
+        if self.action_dim == 19: # Spot
+            ref_pos[1:7] = [0, 0.6, 1.0, 0.0, 0.0, 0.0] # y, z, quat
+        else: # Go2
+            ref_pos[1:7] = [0, 0.38, 1.0, 0.0, 0.0, 0.0] # y, z, quat
         
         # Default leg positions
-        ref_pos[7::3] = 0      # x
-        ref_pos[8::3] = 0.65   # y
-        ref_pos[9::3] = -1.0   # z
+        if self.action_dim == 19: # Spot
+            # fl, fr, hl, hr
+            # 0, 1.04, -1.8
+            nominal_leg = np.array([0, 0.6, -1.1])
+            ref_pos[7:10] = nominal_leg
+            ref_pos[10:13] = nominal_leg
+            ref_pos[13:16] = nominal_leg
+            ref_pos[16:19] = nominal_leg
+            
+            # Arm (7 joints) - keep at home
+            # 0 -3.14 3.06 0 0 0 0
+            ref_pos[19:] = [0, -3.14, 3.06, 0, 0, 0, 0]
+            
+        else: # Go2
+            ref_pos[7::3] = 0      # x
+            ref_pos[8::3] = 0.65   # y
+            ref_pos[9::3] = -1.0   # z
         
         # Gait parameters
-        max_phase = 20
-        half_phase = 10
+        max_phase = 30 if self.action_dim == 19 else 20
+        half_phase = 15 if self.action_dim == 19 else 10
         phase_to_rad = 2 * np.pi / max_phase
         dt = 0.02
         omega = phase_to_rad / dt
@@ -72,47 +106,76 @@ class ILQRPlanner:
         speed_factor_y = 0.4 * speed
         lift_factor_z = 1.0 # Lift height
         
+        if self.action_dim == 19: # Spot
+             # Reduced factors for Spot initially
+            speed_factor_y = 0.2 * speed
+            lift_factor_z = 0.5
+        
         sin_phase = np.sin(phase * phase_to_rad)
         cos_phase = np.cos(phase * phase_to_rad)
         
-        # Velocity factors
-        # d/dt (A * sin(w*t)) = A * w * cos(w*t)
-        # d/dt (A * cos(w*t)) = -A * w * sin(w*t)
+        vy = -speed_factor_y * omega * cos_phase
+        vz = -lift_factor_z * omega * cos_phase
         
         if phase < half_phase:
             # First half
-            # Active legs move:
-            # y = 0.65 - speed_factor_y * sin
-            # z = -1.0 - lift_factor_z * sin
-            
-            vy = -speed_factor_y * omega * cos_phase
-            vz = -lift_factor_z * omega * cos_phase
-            
-            if mode == 0: # Trot: FR (7) and RL (16) lift
-                # FR (idx 7,8,9 -> vel idx 6,7,8)
-                ref_pos[8] = 0.65 - speed_factor_y * sin_phase           
-                ref_pos[9] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[7] = vy
-                ref_vel[8] = vz
+            if mode == 0: # Trot
+                if self.action_dim == 19: # Spot (FR=10.., HL=13..)
+                    # FR (10,11,12) -> vel (9,10,11)
+                    # Note: Spot leg indices: 0=hx, 1=hy, 2=kn.
+                    # Go2: 0=hx, 1=hy, 2=kn.
+                    # Logic is same, just indices.
+                    
+                    # FR (10,11,12)
+                    ref_pos[11] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[12] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[10] = vy
+                    ref_vel[11] = vz
+                    
+                    # HL (13,14,15) -> vel (12,13,14)
+                    ref_pos[14] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[15] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[13] = vy
+                    ref_vel[14] = vz
+                    
+                else: # Go2 (FR=7.., RL=16..)
+                    # FR (7,8,9) -> vel (6,7,8)
+                    ref_pos[8] = 0.65 - speed_factor_y * sin_phase           
+                    ref_pos[9] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[7] = vy
+                    ref_vel[8] = vz
+                    
+                    # RL (16,17,18) -> vel (15,16,17)
+                    ref_pos[17] = 0.65 - speed_factor_y * sin_phase
+                    ref_pos[18] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[16] = vy
+                    ref_vel[17] = vz
                 
-                # RL (idx 16,17,18 -> vel idx 15,16,17)
-                ref_pos[17] = 0.65 - speed_factor_y * sin_phase
-                ref_pos[18] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[16] = vy
-                ref_vel[17] = vz
-                
-            else: # Pace: FR (7) and RR (13) lift
-                # FR
-                ref_pos[8] = 0.65 - speed_factor_y * sin_phase           
-                ref_pos[9] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[7] = vy
-                ref_vel[8] = vz
-                
-                # RR (idx 13,14,15 -> vel idx 12,13,14)
-                ref_pos[14] = 0.65 - speed_factor_y * sin_phase
-                ref_pos[15] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[13] = vy
-                ref_vel[14] = vz
+            else: # Pace
+                if self.action_dim == 19: # Spot (FR=10.., HR=16..)
+                    # FR
+                    ref_pos[11] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[12] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[10] = vy
+                    ref_vel[11] = vz
+                    
+                    # HR
+                    ref_pos[17] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[18] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[16] = vy
+                    ref_vel[17] = vz
+                else: # Go2 (FR=7.., RR=13..)
+                    # FR
+                    ref_pos[8] = 0.65 - speed_factor_y * sin_phase           
+                    ref_pos[9] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[7] = vy
+                    ref_vel[8] = vz
+                    
+                    # RR
+                    ref_pos[14] = 0.65 - speed_factor_y * sin_phase
+                    ref_pos[15] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[13] = vy
+                    ref_vel[14] = vz
             
         else:
             # Second half
@@ -122,31 +185,57 @@ class ILQRPlanner:
             vy = -speed_factor_y * omega * cos_phase
             vz = -lift_factor_z * omega * cos_phase
             
-            if mode == 0: # Trot: FL (10) and RR (13) lift
-                # FL (idx 10,11,12 -> vel idx 9,10,11)
-                ref_pos[11] = 0.65 - speed_factor_y * sin_phase
-                ref_pos[12] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[10] = vy
-                ref_vel[11] = vz
-                
-                # RR
-                ref_pos[14] = 0.65 - speed_factor_y * sin_phase
-                ref_pos[15] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[13] = vy
-                ref_vel[14] = vz
-                
-            else: # Pace: FL (10) and RL (16) lift
-                # FL
-                ref_pos[11] = 0.65 - speed_factor_y * sin_phase
-                ref_pos[12] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[10] = vy
-                ref_vel[11] = vz
-                
-                # RL
-                ref_pos[17] = 0.65 - speed_factor_y * sin_phase
-                ref_pos[18] = -1.0 - lift_factor_z * sin_phase
-                ref_vel[16] = vy
-                ref_vel[17] = vz
+            if mode == 0: # Trot
+                if self.action_dim == 19: # Spot (FL=7.., HR=16..)
+                    # FL
+                    ref_pos[8] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[9] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[7] = vy
+                    ref_vel[8] = vz
+                    
+                    # HR
+                    ref_pos[17] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[18] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[16] = vy
+                    ref_vel[17] = vz
+                else: # Go2 (FL=10.., RR=13..)
+                    # FL
+                    ref_pos[11] = 0.65 - speed_factor_y * sin_phase
+                    ref_pos[12] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[10] = vy
+                    ref_vel[11] = vz
+                    
+                    # RR
+                    ref_pos[14] = 0.65 - speed_factor_y * sin_phase
+                    ref_pos[15] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[13] = vy
+                    ref_vel[14] = vz
+                    
+            else: # Pace
+                if self.action_dim == 19: # Spot (FL=7.., HL=13..)
+                    # FL
+                    ref_pos[8] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[9] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[7] = vy
+                    ref_vel[8] = vz
+                    
+                    # HL
+                    ref_pos[14] = nominal_leg[1] + speed_factor_y * sin_phase
+                    ref_pos[15] = nominal_leg[2] - lift_factor_z * sin_phase
+                    ref_vel[13] = vy
+                    ref_vel[14] = vz
+                else: # Go2 (FL=10.., RL=16..)
+                    # FL
+                    ref_pos[11] = 0.65 - speed_factor_y * sin_phase
+                    ref_pos[12] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[10] = vy
+                    ref_vel[11] = vz
+                    
+                    # RL
+                    ref_pos[17] = 0.65 - speed_factor_y * sin_phase
+                    ref_pos[18] = -1.0 - lift_factor_z * sin_phase
+                    ref_vel[16] = vy
+                    ref_vel[17] = vz
             
         return ref_pos, ref_vel
             
@@ -154,7 +243,7 @@ class ILQRPlanner:
         # Compute Jacobians for all phases (0-19) around reference
         # We assume speed=0, mode=self.mode (standing/trotting/pacing in place)
         
-        phases = range(20)
+        phases = range(20) if self.action_dim == 12 else range(30)
         x_refs = []
         u_refs = [] # Zero control
         aux_refs = []
@@ -165,7 +254,7 @@ class ILQRPlanner:
             xref_full = np.concatenate([xref_pos, xref_vel])
             
             x_refs.append(xref_full)
-            u_refs.append(np.zeros(12))
+            u_refs.append(np.zeros(self.action_dim))
             aux_refs.append((p, 0, 0.0, self.mode)) # sim_step_counter=0, speed=0, mode=self.mode
             
         # We need to compute f(x) and f(x+eps)
@@ -178,9 +267,9 @@ class ILQRPlanner:
         # We need to run 20 envs with the reference states
         # We can use the first 20 envs
         states = []
-        for i in range(20):
-            qpos = x_refs[i][:19]
-            qvel = x_refs[i][19:]
+        for i in range(len(phases)):
+            qpos = x_refs[i][:self.qpos_dim]
+            qvel = x_refs[i][self.qpos_dim:]
             aux = aux_refs[i]
             states.append((qpos, qvel, *aux))
             
@@ -191,7 +280,7 @@ class ILQRPlanner:
         self.env.set_batch_state(states)
         
         # Step with zero actions
-        actions = np.zeros((self.env.n_envs, 12))
+        actions = np.zeros((self.env.n_envs, self.action_dim))
         next_states_nominal, _, _ = self.env.step_dynamics(actions)
         
         # Compute gradients
@@ -201,12 +290,14 @@ class ILQRPlanner:
             
             x_next_nom = next_states_nominal[t]
             
+            half_envs = self.env.n_envs // 2
+            
             # State gradients
             for i in range(self.state_dim):
                 if t % 2 == 0:
                     env_idx = i
                 else:
-                    env_idx = 50 + i
+                    env_idx = half_envs + i
                 
                 x_next_pert = next_states_perturbed[env_idx, t]
                 fx[:, i] = (x_next_pert - x_next_nom) / self.epsilon
@@ -218,7 +309,7 @@ class ILQRPlanner:
                 if t % 2 == 0:
                     env_idx = p_idx
                 else:
-                    env_idx = 50 + p_idx
+                    env_idx = half_envs + p_idx
                     
                 x_next_pert = next_states_perturbed[env_idx, t]
                 fu[:, i] = (x_next_pert - x_next_nom) / self.epsilon
@@ -263,8 +354,9 @@ class ILQRPlanner:
             
             if self.precompute:
                 # Use precomputed gradients
-                # Map phase to 0-19
-                p_idx = int(phase) % 20
+                # Map phase to valid range
+                max_phase = 30 if self.action_dim == 19 else 20
+                p_idx = int(phase) % max_phase
                 fx[t] = self.fx_pre[p_idx]
                 fu[t] = self.fu_pre[p_idx]
             else:
@@ -275,15 +367,17 @@ class ILQRPlanner:
                 x_next_nominal = x_traj[t+1]
                 
                 # State gradients
+                half_envs = self.env.n_envs // 2
+                
                 for i in range(self.state_dim):
                     # vec_env mapping:
-                    # If t is even: 0-49 (p_idx = i)
-                    # If t is odd: 50-99 (p_idx = i)
+                    # If t is even: 0 to half_envs-1 (p_idx = i)
+                    # If t is odd: half_envs to n_envs-1 (p_idx = i)
                     
                     if t % 2 == 0:
                         env_idx = i
                     else:
-                        env_idx = 50 + i
+                        env_idx = half_envs + i
                         
                     x_next_perturbed = next_states_batch[env_idx, t]
                     fx[t, :, i] = (x_next_perturbed - x_next_nominal) / self.epsilon
@@ -296,7 +390,7 @@ class ILQRPlanner:
                     if t % 2 == 0:
                         env_idx = p_idx
                     else:
-                        env_idx = 50 + p_idx
+                        env_idx = half_envs + p_idx
                         
                     x_next_perturbed = next_states_batch[env_idx, t]
                     fu[t, :, i] = (x_next_perturbed - x_next_nominal) / self.epsilon
@@ -386,17 +480,19 @@ class ILQRPlanner:
         H = self.horizon
         
         # Pre-allocate reference array
-        x_refs = np.zeros((H, 37))
+        # Pre-allocate reference array
+        x_refs = np.zeros((H, self.state_dim))
         
         p, s, sp, m = aux_start
         
         # Generate references
         for t in range(H):
             ref_pos, ref_vel = self.get_kinematic_reference(p, sp, m, s)
-            x_refs[t, :19] = ref_pos
-            x_refs[t, 19:] = ref_vel
+            x_refs[t, :self.qpos_dim] = ref_pos
+            x_refs[t, self.qpos_dim:] = ref_vel
             
-            p = (p + 1) % 20
+            max_phase = 30 if self.action_dim == 19 else 20
+            p = (p + 1) % max_phase
             s += 1
             
         # Vectorized cost
@@ -455,10 +551,11 @@ class ILQRPlanner:
             # rollout_feedback doesn't return aux_traj, so we regenerate it locally
             # This is fast (just integer math)
             curr_aux = aux_start
+            max_phase = 30 if self.action_dim == 19 else 20
             for t in range(self.horizon):
                 aux_traj.append(curr_aux)
                 p, s, sp, m = curr_aux
-                curr_aux = ((p + 1) % 20, s + 1, sp, m)
+                curr_aux = ((p + 1) % max_phase, s + 1, sp, m)
         else:
             # Fallback (should not happen)
             print("WARNING: Initial rollout failed, falling back to loop")
@@ -466,14 +563,15 @@ class ILQRPlanner:
             curr_aux = aux_start
             for t in range(self.horizon):
                 aux_traj.append(curr_aux)
-                state_tuple = (curr_x[:19], curr_x[19:], *curr_aux)
+                state_tuple = (curr_x[:self.qpos_dim], curr_x[self.qpos_dim:], *curr_aux)
                 states = [state_tuple] * self.env.n_envs
                 self.env.set_batch_state(states)
                 next_states, _, _ = self.env.step_dynamics(np.array([self.us[t]] * self.env.n_envs))
                 curr_x = next_states[0]
                 xs[t+1] = curr_x
                 p, s, sp, m = curr_aux
-                curr_aux = ((p + 1) % 20, s + 1, sp, m)
+                max_phase = 30 if self.action_dim == 19 else 20
+                curr_aux = ((p + 1) % max_phase, s + 1, sp, m)
             
         # iLQR Loop
         for i in range(self.iterations):
@@ -519,20 +617,32 @@ class ILQRPlanner:
 def main():
     # Parameters
     # Parameters
-    HORIZON = 10 # Reduced from 20 for stability
-    ITERATIONS = 20
+    HORIZON = 20 # Reduced from 20 for stability
+    ITERATIONS = 10
     GAIT_MODE = 1 # 0: Trot, 1: Pace
     
     # Replay mode
     REPLAY_MODE = True
-    NUM_PLAN_STEPS = 100  # Number of steps to plan before replaying
+    NUM_PLAN_STEPS = 1000  # Number of steps to plan before replaying
     PERTURBATION_SCALE = 0.1 # Noise scale for testing robustness
     
-    print("Initializing 100 parallel environments for iLQR...")
-    planning_env = ParallelGo2Env(n_envs=100, render_first=False)
+    # Robot selection
+    ROBOT = "spot" # "go2" or "spot"
+    
+    # Determine n_envs based on robot (Spot needs more due to larger state/action dims)
+    n_envs = 200 if ROBOT == "spot" else 100
+    
+    print(f"Initializing {n_envs} parallel environments for iLQR ({ROBOT})...")
+    
+    if ROBOT == "go2":
+        env_class = Go2Env
+    else:
+        env_class = SpotEnv
+        
+    planning_env = ParallelEnv(n_envs=n_envs, env_class=env_class, render_first=False)
     
     print("Initializing simulation environment...")
-    sim_env = Go2Env(render=True)
+    sim_env = env_class(render=True)
     sim_env.mode = GAIT_MODE # Set gait mode
     
     planner = ILQRPlanner(planning_env, horizon=HORIZON, iterations=ITERATIONS, mode=GAIT_MODE)
@@ -574,7 +684,7 @@ def main():
                     recorded_Ks.append(K.copy())
                 
                 # Execute
-                obs, reward, done, info = sim_env.step(action)
+                obs, reward, done, info = sim_env.step(action + np.random.normal(scale=PERTURBATION_SCALE, size=action.shape))
                 
                 if done:
                     print("Robot fell. Resetting.")
@@ -629,7 +739,7 @@ def main():
                         u_fb = action + K @ (x_curr - x_nom)
                         
                         # Add perturbation
-                        noise = np.random.randn(12) * PERTURBATION_SCALE
+                        noise = np.random.randn(planner.action_dim) * PERTURBATION_SCALE
                         u_fb += noise
                         
                         u_fb = np.clip(u_fb, -1.0, 1.0) # Clip to valid range

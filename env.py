@@ -191,6 +191,27 @@ class Go2Env:
         
         return reward, done
 
+    def step_minimal(self, action):
+        """Ultra-fast step for iLQR rollouts: no obs, no reward, no done check"""
+        self.get_kinematic_reference()
+        
+        # Action is additive to the kinematic reference
+        target_q = action + self.reference[7:]
+        
+        # PD Control Loop
+        for _ in range(self.sim_steps_per_control):
+            # Compute torques
+            current_q = self.data.qpos[7:]
+            current_dq = self.data.qvel[6:]
+            
+            tau = self.Kp * (target_q - current_q) + self.Kd * (0 - current_dq)
+            self.data.ctrl[:] = tau
+            
+            mujoco.mj_step(self.model, self.data)
+            
+        self.phase = (self.phase + 1) % self.max_phase
+        self.sim_step_counter += 1
+
 
     def get_kinematic_reference(self):
         # Optimized kinematic reference computation

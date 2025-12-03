@@ -4,8 +4,9 @@ import numpy as np
 import time
 import os
 from env import Go2Env
+from spot_env import SpotEnv
 
-def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_names, shapes, dtypes):
+def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_names, shapes, dtypes, n_envs_total, dims):
     parent_remote.close()
     
     # Initialize multiple environments
@@ -48,31 +49,35 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                 # data is actions
                 actions = data
                 next_states = []
-                rewards = []
-                dones = []
+                # rewards = []
+                # dones = []
                 
                 for i, env in enumerate(envs):
-                    # Step
-                    ob, reward, done, info = env.step(actions[i])
-                    # Do NOT reset
+                    # ob, reward, done, info = env.step(actions[i])
+                    env.step_minimal(actions[i])
                     
                     # Get full state
                     qpos = env.data.qpos.copy()
                     qvel = env.data.qvel.copy()
                     next_states.append(np.concatenate([qpos, qvel]))
-                    rewards.append(reward)
-                    dones.append(done)
+                    # rewards.append(reward)
+                    # dones.append(done)
                     
-                remote.send((np.stack(next_states), np.stack(rewards), np.stack(dones)))
+                remote.send((np.stack(next_states), None, None))
 
             elif cmd == 'compute_jacobians':
                 # data is (x_traj, u_traj, aux_traj, epsilon)
                 x_traj, u_traj, aux_traj, epsilon = data
                 H = len(x_traj)
                 
-                # Results: (n_envs_local, H, 37)
+                # Results: (n_envs_local, H, state_dim)
                 # We will populate this sparsely but deterministically
-                results = np.zeros((n_envs_local, H, 37))
+                state_dim = dims['state_dim']
+                qpos_dim = dims['qpos_dim']
+                qvel_dim = dims['qvel_dim']
+                action_dim = dims['action_dim']
+                
+                results = np.zeros((n_envs_local, H, state_dim))
                 
                 # Iterate in blocks of 2 time steps
                 for t_block in range(0, H, 2):
@@ -81,13 +86,16 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                         global_idx = start_idx + i
                         
                         # Map global_idx to (t_offset, p_idx)
-                        # 0-49: t_block, 50-99: t_block + 1
-                        if global_idx < 50:
+                        # 0 to half_envs-1: t_block
+                        # half_envs to n_envs-1: t_block + 1
+                        half_envs = n_envs_total // 2
+                        
+                        if global_idx < half_envs:
                             t_offset = 0
                             p_idx = global_idx
                         else:
                             t_offset = 1
-                            p_idx = global_idx - 50
+                            p_idx = global_idx - half_envs
                             
                         t = t_block + t_offset
                         
@@ -99,22 +107,24 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                         u_nominal = u_traj[t]
                         aux = aux_traj[t]
                         
-                        qpos = x_nominal[:19].copy()
-                        qvel = x_nominal[19:].copy()
+                        qpos = x_nominal[:qpos_dim].copy()
+                        qvel = x_nominal[qpos_dim:].copy()
                         u = u_nominal.copy()
                         
                         # Apply perturbation (Forward Difference)
-                        # p_idx 0-36: state, 37-48: action
-                        if p_idx < 37:
+                        # Apply perturbation (Forward Difference)
+                        # p_idx 0 to state_dim-1: state
+                        # state_dim to state_dim+action_dim-1: action
+                        if p_idx < state_dim:
                             # x + eps
                             dim = p_idx
-                            if dim < 19:
+                            if dim < qpos_dim:
                                 qpos[dim] += epsilon
                             else:
-                                qvel[dim - 19] += epsilon
-                        elif p_idx < 49:
+                                qvel[dim - qpos_dim] += epsilon
+                        elif p_idx < state_dim + action_dim:
                             # u + eps
-                            dim = p_idx - 37
+                            dim = p_idx - state_dim
                             u[dim] += epsilon
                         else:
                             # Idle env (e.g. index 49, 99)
@@ -124,7 +134,8 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                         env.set_state((qpos, qvel, *aux))
                         
                         # Step
-                        ob, reward, done, info = env.step(u)
+                        # ob, reward, done, info = env.step(u)
+                        env.step_minimal(u)
                         
                         # Get next state
                         qpos_next = env.data.qpos.copy()
@@ -138,31 +149,53 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                 x0, u_nom, x_nom, k, K, alphas, aux_start = data
                 H = len(u_nom)
                 
+                # Extract dimensions
+                state_dim = dims['state_dim']
+                qpos_dim = dims['qpos_dim']
+                qvel_dim = dims['qvel_dim']
+                action_dim = dims['action_dim']
+                
                 # Each env handles one alpha
-                # global_idx = start_idx + i
+                # We want to distribute alphas across workers to run in parallel
+                # Instead of using first N envs (which might be on same worker),
+                # we stride them across the total environments.
+                
+                n_alphas = len(alphas)
+                stride = max(1, n_envs_total // n_alphas)
                 
                 results = []
                 
                 for i, env in enumerate(envs):
                     global_idx = start_idx + i
                     
-                    if global_idx < len(alphas):
-                        alpha = alphas[global_idx]
+                    # Check if this env is assigned a task
+                    # We assign task j to env (j * stride)
+                    # So we check if global_idx is a multiple of stride
+                    # and if the corresponding task index is valid
+                    
+                    task_idx = -1
+                    if n_alphas > 0:
+                        if global_idx % stride == 0:
+                            idx = global_idx // stride
+                            if idx < n_alphas:
+                                task_idx = idx
+                    
+                    if task_idx >= 0:
+                        alpha = alphas[task_idx]
                         
                         # Initialize
-                        qpos = x0[:19]
-                        qvel = x0[19:]
+                        qpos = x0[:qpos_dim]
+                        qvel = x0[qpos_dim:]
                         env.set_state((qpos, qvel, *aux_start))
                         
                         curr_x = x0.copy()
                         curr_aux = aux_start
                         
-                        x_traj = np.zeros((H + 1, 37))
-                        u_traj = np.zeros((H, 12))
+                        x_traj = np.zeros((H + 1, state_dim))
+                        u_traj = np.zeros((H, action_dim))
                         x_traj[0] = curr_x
                         
                         valid = True
-                        
                         for t in range(H):
                             # Control law
                             dx = curr_x - x_nom[t]
@@ -171,7 +204,8 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                             u_traj[t] = u
                             
                             # Step
-                            ob, reward, done, info = env.step(u)
+                            # ob, reward, done, info = env.step(u)
+                            env.step_minimal(u)
                             
                             # Get next state
                             qpos_next = env.data.qpos.copy()
@@ -181,14 +215,7 @@ def worker(remote, parent_remote, env_fn_wrapper, n_envs_local, start_idx, shm_n
                             
                             # Update aux (approximate)
                             p, s, sp, m = curr_aux
-                            curr_aux = ((p + 1) % 20, s + 1, sp, m)
-                            
-                            if done:
-                                # Handle fall?
-                                # Just return what we have?
-                                # Or mark as invalid?
-                                # For now, let's continue but maybe cost will be high
-                                pass
+                            curr_aux = ((p + 1) % env.max_phase, s + 1, sp, m)
                                 
                         results.append((x_traj, u_traj, alpha))
                     else:
@@ -296,11 +323,33 @@ class CloudpickleWrapper(object):
         import pickle
         self.x = pickle.loads(ob)
 
-class ParallelGo2Env:
-    def __init__(self, n_envs, render_first=False, max_horizon=100):
+class ParallelEnv:
+    def __init__(self, n_envs, env_class=Go2Env, render_first=False, max_horizon=100):
         self.n_envs = n_envs
         self.max_horizon = max_horizon
-        self.action_dim = 12
+        
+        # Determine dimensions from a dummy env
+        dummy_env = env_class(render=False)
+        self.qpos_dim = dummy_env.qpos_dim
+        self.qvel_dim = dummy_env.qvel_dim
+        self.action_dim = getattr(dummy_env, 'action_dim', 12) # Default to 12 if not set (Go2Env doesn't set it explicitly in init but uses 12)
+        # Actually Go2Env doesn't set action_dim in init, it's implicit. 
+        # Let's check env.py... it says self.n_joints = 12.
+        # SpotEnv sets self.n_joints = 19.
+        # Let's use n_joints as action_dim.
+        if hasattr(dummy_env, 'n_joints'):
+            self.action_dim = dummy_env.n_joints
+            
+        self.state_dim = self.qpos_dim + self.qvel_dim
+        dummy_env.close()
+        
+        self.dims = {
+            'qpos_dim': self.qpos_dim,
+            'qvel_dim': self.qvel_dim,
+            'action_dim': self.action_dim,
+            'state_dim': self.state_dim
+        }
+        
         self.closed = False
         
         # Determine number of workers
@@ -317,7 +366,7 @@ class ParallelGo2Env:
         
         def make_env(render):
             def _thunk():
-                return Go2Env(render=render)
+                return env_class(render=render)
             return _thunk
 
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(self.n_workers)])
@@ -370,7 +419,9 @@ class ParallelGo2Env:
                 start_idx,
                 self.shm_names,
                 self.shapes,
-                self.dtypes
+                self.dtypes,
+                n_envs,
+                self.dims
             ))
             p.daemon = True
             p.start()
@@ -407,7 +458,10 @@ class ParallelGo2Env:
         results = [remote.recv() for remote in self.remotes]
         next_states, rews, dones = zip(*results)
         
-        return np.concatenate(next_states), np.concatenate(rews), np.concatenate(dones)
+        if rews[0] is None:
+            return np.concatenate(next_states), None, None
+        else:
+            return np.concatenate(next_states), np.concatenate(rews), np.concatenate(dones)
 
 
     def reset(self):
@@ -527,25 +581,23 @@ class ParallelGo2Env:
     def __del__(self):
         self.close()
 
+# Alias for backward compatibility
+ParallelGo2Env = ParallelEnv
+
 if __name__ == "__main__":
     # Test the parallel environment
     n_envs = 10
-    env = ParallelGo2Env(n_envs, render_first=False)
-    
+    # Test with Go2
+    print("Testing Go2...")
+    env = ParallelEnv(n_envs, env_class=Go2Env, render_first=False)
     obs = env.reset()
-    print(f"Reset done. Obs shape: {obs.shape}")
+    print(f"Go2 Reset done. Obs shape: {obs.shape}")
+    env.close()
     
-    start_time = time.time()
-    steps = 1000
-    
-    try:
-        # Test rollout
-        horizon = 20
-        actions = np.zeros((n_envs, horizon, 12))
-        rewards, dones = env.rollout(actions)
-        print(f"Rollout done. Rewards shape: {rewards.shape}")
-                
-    except KeyboardInterrupt:
-        pass
-    finally:
-        env.close()
+    # Test with Spot
+    print("\nTesting Spot...")
+    env = ParallelEnv(n_envs, env_class=SpotEnv, render_first=False)
+    obs = env.reset()
+    print(f"Spot Reset done. Obs shape: {obs.shape}")
+    env.close()
+
